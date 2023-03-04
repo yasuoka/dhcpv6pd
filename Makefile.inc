@@ -1,0 +1,3 @@
+CPPFLAGS=	-I${.CURDIR}/..
+
+.PATH:	${.CURDIR}/..
