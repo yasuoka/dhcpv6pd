@@ -96,6 +96,7 @@ static void	 dhcpv6_client_transition(struct dhcpv6_client *,
 		    enum dhcpv6_client_state);
 static void	 dhcpv6_client_set_timer(struct dhcpv6_client *, int64_t);
 static int	 dhcpv6_client_receive(struct dhcpv6_client *, u_char *, int);
+static void	 dhcpv6_client_set_timer(struct dhcpv6_client *, int64_t);
 static int	 dhcpv6_client_close(struct dhcpv6_client *);
 static void	 dhcpv6_client_on_event(int, short, void *);
 static void	 dhcpv6_client_on_timer(int, short, void *);
@@ -461,7 +462,7 @@ dhcpv6_client_transition(struct dhcpv6_client *self,
 		else if (self->pd->t1 < 3)
 			delay = 3000;
 		else
-			delay = self->pd->t1 * 10000 -
+			delay = self->pd->t1 * 1000 -
 			    (get_uptime(false) - self->t0);
 		if (delay < 0)
 			dhcpv6_client_transition(self, STATE_RENEWING);
@@ -475,7 +476,7 @@ dhcpv6_client_transition(struct dhcpv6_client *self,
 		else if (self->pd->t2 < 3)
 			delay = 3000;
 		else
-			delay = self->pd->t2 * 10000 -
+			delay = self->pd->t2 * 1000 -
 			    (get_uptime(false) - self->t0);
 		if (delay < 0) {
 			free(self->sid);
@@ -536,6 +537,9 @@ dhcpv6_client_set_timer(struct dhcpv6_client *self, int64_t millis)
 	tv.tv_sec = millis / 1000; 
 	tv.tv_usec = (millis % 1000) * 1000;
 	evtimer_add(&self->ev_timer, &tv);
+	DHCPV6PD_DBG("%s(state=%u) %lld.%06ld", __func__, (int)self->state,
+	tv.tv_sec, tv.tv_usec);
+
 }
 
 int
