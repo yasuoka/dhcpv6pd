@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2023 YASUOKA Masahiko <yasuoka@yasuoka.net>
  * Copyright (c) 2019 Internet Initiative Japan Inc.
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  *
@@ -17,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <netinet/in.h>
 
 #include <err.h>
 #include <errno.h>
@@ -35,6 +37,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "dhcpv6.h"
 #include "dhcpv6pdd.h"
 #include "dhcpv6pdd_local.h"
 
@@ -45,12 +48,14 @@ static char	 conffile[PATH_MAX];
 static struct dhcpv6pdd_conf
 		*curr_conf;
 static bool	 terminated = false;
+static struct imsgev
+		 main_iev;
 
 static pid_t	 start_child(const char *, int, char *[], int);
 static void	 parent_dispatch_main(int, short, void *);
 static void	 parent_dispatch_control(int, short, void *);
 static void	 parent_on_signal(int, short, void *);
-static void	 vlog(int, const char *, va_list);
+static int	 dhcpdv6_client_socket(void);
 
 static void
 usage(void)
@@ -64,9 +69,9 @@ int
 main(int argc, char *argv[])
 {
 	int		  ch, argc0, fds[2];
-	char 		**argv0;
+	char		**argv0;
 	const char	 *conffile0 = DHCPV6PDD_CONF, *procname = NULL;
-	struct imsgev	  main_iev, control_iev;
+	struct imsgev	  control_iev;
 	pid_t		  main_pid, control_pid;
 	struct event	  evsigint, evsighup, evsigterm;
 
@@ -98,7 +103,7 @@ main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if ((realpath(conffile0, conffile)) == NULL)
+	if ((realpath(conffile0, conffile)) == NULL && errno != ENOENT)
 		err(EX_CONFIG, "%s", conffile0);
 	curr_conf = parse_config(conffile);
 	if (curr_conf == NULL)
@@ -126,8 +131,8 @@ main(int argc, char *argv[])
 
 	if (unveil(argv0[0], "x") == -1)
 		fatal("unveil");
-	if (pledge("stdio exec proc sendfd unveil", NULL) == -1)
-		fatal("pledge");
+//	if (pledge("stdio exec proc sendfd unveil", NULL) == -1)
+//		fatal("pledge");
 	/*
 	 * Start "main" proccess and prepare the IPC with it
 	 */
@@ -152,8 +157,8 @@ main(int argc, char *argv[])
 
 	if (unveil(argv0[0], "") == -1)
 		fatal("unveil");
-	if (pledge("stdio sendfd", NULL) == -1)
-		fatal("pledge");
+//	if (pledge("stdio sendfd", NULL) == -1)
+//		fatal("pledge");
 
 	event_init();
 
@@ -181,6 +186,43 @@ main(int argc, char *argv[])
 	imsg_event_add(&main_iev);
 	imsg_event_add(&control_iev);
 
+	imsg_compose_event(&main_iev, IMSG_CONFIG, 0, 0, -1, curr_conf,
+	    sizeof(*curr_conf));
+
+	int sock = dhcpdv6_client_socket();
+	if (sock < 0)
+		exit(EXIT_FAILURE);
+	if (imsg_compose_event(&main_iev, IMSG_CLIENT_SOCK,
+	    0, 0, sock, NULL, 0) == -1)
+		fatal("imsg_compose_event() failed");
+    {
+	#include <net/if_dl.h>
+	#include <ifaddrs.h>
+	struct ifaddrs		*ifa0, *ifa;
+	struct dhcpv6pdd_iface	 iface;
+	struct sockaddr_dl	*sdl;
+
+	getifaddrs(&ifa0);
+	for (ifa = ifa0; ifa != NULL; ifa = ifa->ifa_next) {
+		if (strcmp(ifa->ifa_name, "vmx0") == 0 &&
+		    ifa->ifa_addr->sa_family == AF_LINK)
+			break;
+	}
+	if (ifa == NULL) {
+		/* XXX */
+	} else {
+
+		sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+		strlcpy(iface.ifname, ifa->ifa_name, sizeof(iface.ifname));
+		iface.ifidx = sdl->sdl_index;
+		memcpy(iface.lladdr, LLADDR(sdl),
+		    MINIMUM(sizeof(iface.lladdr), sdl->sdl_alen));
+		if (imsg_compose_event(&main_iev, IMSG_NEW_INTERFACE,
+		    0, 0, -1, &iface, sizeof(iface)) == -1)
+			fatal("imsg_compose_event() failed");
+	}
+	freeifaddrs(ifa0);
+    }
 	event_loop(0);
 
 	/* terminated */
@@ -349,10 +391,25 @@ parent_dispatch_control(int fd, short ev, void *ctx)
 void
 parent_on_signal(int sig, short ev, void *ctx)
 {
+	static struct dhcpv6pdd_conf *new_conf;
 	switch (sig) {
 	case SIGHUP:
 		dhcpv6pd_log(LOG_INFO, "caught SIGHUP");
-		/* TODO reload config ? */
+		if (conffile[0] != '\0') {
+			parse_config(conffile);
+			new_conf = parse_config(conffile);
+			if (new_conf != NULL) {
+				dhcpv6pd_log(LOG_INFO,
+				    "Reload configuration failure");
+			} else {
+				dhcpv6pd_log(LOG_INFO,
+				    "Reload configuration successfully");
+				free(curr_conf);
+				curr_conf = new_conf;
+				imsg_compose_event(&main_iev, IMSG_CONFIG, 0,
+				    0, -1, curr_conf, sizeof(*curr_conf));
+			}
+		}
 		break;
 	case SIGINT:
 	case SIGTERM:
@@ -362,6 +419,32 @@ parent_on_signal(int sig, short ev, void *ctx)
 		event_loopbreak();
 		break;
 	}
+}
+
+int
+dhcpdv6_client_socket(void)
+{
+	int			 sock = -1;
+	struct sockaddr_in6	 sin6;
+
+	if ((sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+		log_warn("socket()");
+		goto on_error;
+	}
+	memset(&sin6, 0, sizeof(sin6));
+	sin6.sin6_family = AF_INET6;
+	sin6.sin6_len = sizeof(sin6);
+	sin6.sin6_port = htons(DHCPV6_CLIENT_PORT);
+	if (bind(sock, (struct sockaddr *)&sin6, sizeof(sin6)) == -1) {
+		log_warn("bind()");
+		goto on_error;
+	}
+
+	return (sock);
+on_error:
+	if (sock >= 0)
+		close(sock);
+	return (-1);
 }
 
 /***********************************************************************

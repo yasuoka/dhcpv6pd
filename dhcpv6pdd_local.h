@@ -24,14 +24,47 @@ struct imsgev {
 /* internal messages */
 enum dhcpv6pdd_imsg_type {
 	IMSG_PIPE_CONTROL = IMSG_MIN,
-	IMSG_PIPE_MAIN
+	IMSG_PIPE_MAIN,
+	IMSG_CONFIG,
+	IMSG_CLIENT_SOCK,
+	IMSG_NEW_INTERFACE
 };
 
 struct dhcpv6pdd_conf {
+	int	sol_max_delay;
+	int	sol_timeout;
+	int	sol_max_rt;
+	int	req_timeout;
+	int	req_max_rt;
+	int	req_max_rc;
+
+	int	ren_timeout;
+	int	ren_max_rt;
+
+	int	reb_timeout;
+	int	reb_max_rt;
+
+	int	rel_timeout;
+	int	rel_max_rc;
+
+	int	rate_limit_packets;
+	int	rate_limit_seconds;
+};
+
+#include <net/if.h>
+
+struct dhcpv6pdd_iface {
+	char		 ifname[IFNAMSIZ];
+	u_int		 ifidx;
+	u_char		 lladdr[6];
 };
 
 #ifndef nitems
 #define nitems(_x) (sizeof((_x)) / sizeof((_x)[0]))
+#endif
+
+#ifndef MINIMUM
+#define MINIMUM(_a, _b)	(((_a) < (_b))? (_a) : (_b))
 #endif
 
 /* from parse.y */
@@ -41,6 +74,7 @@ struct dhcpv6pdd_conf
 /* from dhcpv6pdd.c */
 void		 dhcpv6pd_log(int, const char *, ...)
 		    __attribute__((__format__ (printf, 2, 3)));
+void	 	 vlog(int, const char *, va_list);
 __dead void	 fatal(const char *);
 __dead void	 fatalx(const char *);
 void		 log_warn(const char *, ...)

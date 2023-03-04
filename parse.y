@@ -29,15 +29,18 @@
 
 #include <ctype.h>
 #include <err.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <syslog.h>
 #include <unistd.h>
 
+#include "dhcpv6.h"
 #include "dhcpv6pdd_local.h"
 
 static struct dhcpv6pdd_conf *conf = NULL;
+
 
 TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
 static struct file {
@@ -75,6 +78,7 @@ struct sym {
 	char			*val;
 };
 int		 symset(const char *, const char *, int);
+int		 cmdline_symset(char *);
 char		*symget(const char *);
 
 typedef struct {
@@ -88,8 +92,10 @@ typedef struct {
 %}
 
 %token	INCLUDE ERROR
+%token	MAX_DELAY REQUEST REBIND RELEASE RENEW SOLICIT TIMEOUT COUNT
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
+%type   <v.number>	count_opt
 
 %%
 
@@ -97,6 +103,7 @@ grammar		: /* empty */
 		| grammar '\n'
 		| grammar include '\n'
 		| grammar varset '\n'
+		| grammar timeout '\n'
 		;
 
 include		: INCLUDE STRING		{
@@ -132,6 +139,133 @@ varset		: STRING '=' STRING	{
 		}
 		;
 
+timeout		: SOLICIT MAX_DELAY NUMBER {
+			if ($3 < 0) {
+				yyerror("max-delay must be positive");
+				YYERROR;
+			}
+			conf->sol_max_delay = $3;
+		}
+		| SOLICIT TIMEOUT NUMBER {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= conf->sol_max_rt) {
+				yyerror("timeout must be less than the max"
+				    "(%d)", (int)conf->sol_max_rt);
+				YYERROR;
+			}
+			conf->sol_timeout = $3;
+		}
+		| SOLICIT TIMEOUT NUMBER NUMBER {
+			conf->sol_timeout = $3;
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= $4) {
+				yyerror("timeout must be less than the max");
+				YYERROR;
+			}
+			conf->sol_max_rt = $4;
+		}
+		| REQUEST TIMEOUT NUMBER count_opt {
+			conf->req_timeout = $3;
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= conf->req_max_rt) {
+				yyerror("timeout must be less than the max"
+				    "(%d)", (int)conf->req_max_rt);
+				YYERROR;
+			}
+			if ($4 == 0)
+				conf->req_max_rc = $4;
+		}
+		| REQUEST TIMEOUT NUMBER NUMBER count_opt {
+			conf->req_timeout = $3;
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= $4) {
+				yyerror("timeout must be less than the max");
+				YYERROR;
+			}
+			conf->req_max_rt = $4;
+			if ($5 == 0)
+				conf->req_max_rc = $5;
+		}
+		| RENEW TIMEOUT NUMBER {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= conf->ren_max_rt) {
+				yyerror("timeout must be less than the max"
+				    "(%d)", (int)conf->ren_max_rt);
+				YYERROR;
+			}
+			conf->ren_timeout = $3;
+		}
+		| RENEW TIMEOUT NUMBER NUMBER {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= $4) {
+				yyerror("timeout must be less than the max");
+				YYERROR;
+			}
+			conf->ren_timeout = $3;
+			conf->ren_max_rt = $4;
+		}
+		| REBIND TIMEOUT NUMBER {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= conf->reb_max_rt) {
+				yyerror("timeout must be less than the max"
+				    "(%d)", (int)conf->reb_max_rt);
+				YYERROR;
+			}
+			conf->reb_timeout = $3;
+		}
+		| REBIND TIMEOUT NUMBER NUMBER {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			if ($3 >= $4) {
+				yyerror("timeout must be less than the max");
+				YYERROR;
+			}
+			conf->reb_timeout = $3;
+			conf->reb_max_rt = $4;
+		}
+		| RELEASE TIMEOUT NUMBER count_opt {
+			if ($3 <= 0) {
+				yyerror("timeout must be greater than 0");
+				YYERROR;
+			}
+			conf->rel_timeout = $3;
+			if ($4 == 0)
+				conf->rel_max_rc = $4;
+		}
+		;
+count_opt	: /* empty */ {
+			$$ = 0;
+		}
+		| COUNT NUMBER {
+			if ($2 <= 0) {
+				yyerror("count must be greater than 0");
+				YYERROR;
+			}
+			$$ = $2;
+		}
 %%
 
 struct keywords {
@@ -166,7 +300,15 @@ lookup(char *s)
 {
 	/* this has to be sorted always */
 	static const struct keywords keywords[] = {
+		{ "count",		COUNT },
 		{ "include",		INCLUDE },
+		{ "max-delay",		MAX_DELAY },
+		{ "rebind",		REBIND },
+		{ "release",		RELEASE },
+		{ "renew",		RENEW },
+		{ "request",		REQUEST },
+		{ "solicit",		SOLICIT },
+		{ "timeout",		TIMEOUT }
 	};
 	const struct keywords	*p;
 
@@ -596,13 +738,32 @@ symget(const char *nam)
 struct dhcpv6pdd_conf *
 parse_config(const char *filename)
 {
-	int	 errors;
+	int		 errors;
+	struct stat	 st;
 
 	if ((conf = calloc(1, sizeof(*conf))) == NULL) {
 		log_warn("cannot allocate memory");
 		return (NULL);
 	}
+	conf->sol_max_delay = DHCPV6_SOL_MAX_DELAY;
+	conf->sol_timeout = DHCPV6_SOL_TIMEOUT;
+	conf->sol_max_rt = DHCPV6_SOL_MAX_RT;
+	conf->req_timeout = DHCPV6_REQ_TIMEOUT;
+	conf->req_max_rt = DHCPV6_REQ_MAX_RT;
+	conf->req_max_rc = DHCPV6_REQ_MAX_RC;
+	conf->ren_timeout = DHCPV6_REN_TIMEOUT;
+	conf->ren_max_rt = DHCPV6_REN_MAX_RT;
+	conf->reb_timeout = DHCPV6_REB_TIMEOUT;
+	conf->reb_max_rt = DHCPV6_REB_MAX_RT;
+	conf->rel_timeout = DHCPV6_REL_TIMEOUT;
+	conf->rel_max_rc = DHCPV6_REL_MAX_RC;
+	conf->rate_limit_packets = 20; /* A possible default could be 20 */
+	conf->rate_limit_seconds = 20; /* packets in 20 seconds (RFC 8415
+					  p.42) */
 
+	/* Ok if no config file */
+	if (stat(filename, &st) == -1 && errno == ENOENT)
+		return (conf);
 	if ((file = pushfile(filename, 0)) == NULL) {
 		free(conf);
 		return (NULL);

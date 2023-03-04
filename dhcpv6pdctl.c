@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2023 YASUOKA Masahiko <yasuoka@yasuoka.net>
  * Copyright (c) 2019 Internet Initiative Japan Inc.
  *
  * Permission to use, copy, modify, and distribute this software for any
